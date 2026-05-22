@@ -1,0 +1,101 @@
+const { PrismaClient } = require('@prisma/client');
+const { syncToGoogleCalendar, deleteFromGoogleCalendar } = require('../integrations/googleCalendar');
+
+const prisma = new PrismaClient();
+
+const listAppointments = async (req, res) => {
+  try {
+    const { id: userId, role } = req.user;
+    const where = role === 'CLIENT' ? { clientId: userId } : { professionalId: userId };
+
+    const appointments = await prisma.appointment.findMany({
+      where,
+      include: { service: true, professional: { include: { user: { select: { name: true } } } }, client: { select: { name: true, email: true } } },
+      orderBy: { scheduledAt: 'asc' }
+    });
+    res.json(appointments);
+  } catch (err) {
+    res.status(500).json({ error: 'Erro ao listar agendamentos' });
+  }
+};
+
+const createAppointment = async (req, res) => {
+  try {
+    const { professionalId, serviceId, scheduledAt } = req.body;
+    const clientId = req.user.id;
+
+    if (!professionalId || !serviceId || !scheduledAt)
+      return res.status(400).json({ error: 'professionalId, serviceId e scheduledAt são obrigatórios' });
+
+    // Check availability
+    const conflict = await prisma.appointment.findFirst({
+      where: { professionalId, scheduledAt: new Date(scheduledAt), status: 'CONFIRMED' }
+    });
+    if (conflict)
+      return res.status(409).json({ error: 'Horário indisponível' });
+
+    const appointment = await prisma.appointment.create({
+      data: { clientId, professionalId, serviceId, scheduledAt: new Date(scheduledAt), status: 'CONFIRMED' },
+      include: { service: true }
+    });
+
+    // Sync to Google Calendar
+    try {
+      const googleEventId = await syncToGoogleCalendar(appointment);
+      if (googleEventId) {
+        await prisma.appointment.update({ where: { id: appointment.id }, data: { googleEventId } });
+      }
+    } catch (gcalErr) {
+      console.error('Google Calendar sync failed:', gcalErr.message);
+    }
+
+    res.status(201).json(appointment);
+  } catch (err) {
+    res.status(500).json({ error: 'Erro ao criar agendamento' });
+  }
+};
+
+const cancelAppointment = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.id;
+
+    const appointment = await prisma.appointment.findUnique({ where: { id } });
+    if (!appointment) return res.status(404).json({ error: 'Agendamento não encontrado' });
+    if (appointment.clientId !== userId) return res.status(403).json({ error: 'Sem permissão' });
+    if (appointment.status === 'CANCELLED') return res.status(400).json({ error: 'Agendamento já cancelado' });
+
+    // Check cancellation window (2h before)
+    const now = new Date();
+    const diff = (new Date(appointment.scheduledAt) - now) / 1000 / 60 / 60;
+    if (diff < 2) return res.status(400).json({ error: 'Cancelamento permitido somente até 2h antes do horário' });
+
+    const updated = await prisma.appointment.update({
+      where: { id }, data: { status: 'CANCELLED' }
+    });
+
+    if (appointment.googleEventId) {
+      try { await deleteFromGoogleCalendar(appointment.googleEventId); } catch (e) {}
+    }
+
+    res.json(updated);
+  } catch (err) {
+    res.status(500).json({ error: 'Erro ao cancelar agendamento' });
+  }
+};
+
+const getAppointment = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const appointment = await prisma.appointment.findUnique({
+      where: { id },
+      include: { service: true, professional: { include: { user: { select: { name: true } } } }, client: { select: { name: true } } }
+    });
+    if (!appointment) return res.status(404).json({ error: 'Agendamento não encontrado' });
+    res.json(appointment);
+  } catch (err) {
+    res.status(500).json({ error: 'Erro ao buscar agendamento' });
+  }
+};
+
+module.exports = { listAppointments, createAppointment, cancelAppointment, getAppointment };
